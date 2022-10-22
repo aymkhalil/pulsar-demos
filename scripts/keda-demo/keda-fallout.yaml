@@ -1,0 +1,326 @@
+# Keda pulsar scaler demo:
+ensemble:
+  servers:
+  - name: server
+    node.count: 6
+    provisioner:
+      name: gke
+      properties:
+        # GKE cluster name must be less than 40 characters (https://datastax.jira.com/browse/FAL-1561)
+        name: keda-pulsar-scaler-demo-chart
+        project: datastax-gcp-pulsar
+        gcloud.service_account: fallout-haxx-tests-runner@datastax-gcp-pulsar.iam.gserviceaccount.com
+        zone: us-central1-a
+        machine.type: e2-standard-4
+        create.extra_args: |
+            --no-enable-basic-auth \
+            --cluster-version "1.21" \
+            --image-type "COS" \
+            --disk-type "pd-standard" \
+            --disk-size "40" \
+            --metadata disable-legacy-endpoints=true \
+            --scopes "https://www.googleapis.com/auth/cloud-platform" \
+            --enable-ip-alias \
+            --default-max-pods-per-node "80" \
+            --addons HorizontalPodAutoscaling,HttpLoadBalancing \
+            --network "projects/datastax-gcp-pulsar/global/networks/default" \
+            --create-subnetwork name="" \
+            --service-account=fallout-haxx-tests-runner@datastax-gcp-pulsar.iam.gserviceaccount.com
+    configuration_manager:
+      - name: helm
+        properties:
+          namespace: 'pulsar'
+          helm.install.type: git
+          helm.install.name: 'pulsar'
+          helm.install.values.file: <<file:pulsar-values.yaml>>
+          # NOTE:  cert-manager.startupapicheck.enabled had to be added as client-server-compatibility
+          # get stuck on that check on SETUP, for some reason
+          helm.install.set:
+            - 'cert-manager.startupapicheck.enabled=false'
+          helm.install.debug: true
+          helm.install.timeout: 1200s
+          helm.install.dependency_update: true
+          git.repository: "https://github.com/datastax/pulsar-helm-chart"
+          git.chart.location: "helm-chart-sources/pulsar"
+          git.branch:  "master"
+          # NOTE: we can't move kubernetes_logs here due to the fact that offload and keyshared tests need extra values
+      - name: kubernetes_logs
+        properties:
+          container_logs_namespace: mypulsar
+          ignore_failures: true
+      - name: helm
+        properties:
+          namespace: 'keda'
+          helm.install.type: repo
+          helm.install.name: 'keda'
+          helm.install.debug: true
+          helm.install.timeout: 1200s
+          helm.install.dependency_update: true
+          helm.repo.name: kedacore
+          helm.repo.url: "https://kedacore.github.io/charts"
+          helm.chart.name: "kedacore/keda"   
+    local_files:
+      - path: create-topic.yaml
+        yaml:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: create-topic
+          spec:
+            template:
+              metadata:
+                labels:
+                  app: create-topic
+              spec:
+                containers:
+                - name: create-topic
+                  image: datastax/lunastreaming:2.10_2.3
+                  command:
+                    - /bin/bash
+                    - -c
+                    - >-
+                      set -e && env &&
+                      export PULSAR_EXTRA_OPTS="-Xmx1G" &&
+                      /pulsar/bin/apply-config-from-env.py /pulsar/conf/client.conf &&
+                      bin/pulsar-admin topics create-partitioned-topic -p 4 persistent://public/default/test &&
+                      bin/pulsar-admin topics create-subscription -s subcrname persistent://public/default/test
+                  env:
+                    - name: webServiceUrl
+                      value: http://pulsar-proxy.pulsar.svc.cluster.local:8080/
+                    - name: brokerServiceUrl
+                      value: pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650/
+                restartPolicy: Never
+      - path: consumer.yaml
+        yaml:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: consumer
+          spec:
+            #replicas: 2
+            selector:
+              matchLabels:
+                app: consumer
+            template:
+              metadata:
+                labels:
+                  app: consumer
+              spec:
+                containers:
+                - name: consumer
+                  image: datastax/lunastreaming:2.10_2.3
+                  command:
+                    - /bin/bash
+                    - -c
+                    - >-
+                      set -e && env &&
+                      export PULSAR_EXTRA_OPTS="-Xmx1G" &&
+                      /pulsar/bin/apply-config-from-env.py /pulsar/conf/client.conf &&
+                      bin/pulsar-perf consume
+                      -i 20
+                      -r 50
+                      -st Shared
+                      -ss subcrname
+                      -u pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650/
+                      persistent://public/default/test
+                  env:
+                    - name: webServiceUrl
+                      value: http://pulsar-proxy.pulsar.svc.cluster.local:8080/
+                    - name: brokerServiceUrl
+                      value: pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650/
+                restartPolicy: Always
+      - path: producer.yaml
+        yaml:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: producer
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: producer
+            template:
+              metadata:
+                labels:
+                  app: producer
+              spec:
+                containers:
+                - name: producer
+                  image: datastax/lunastreaming:2.10_2.3
+                  command:
+                    - /bin/bash
+                    - -c
+                    - >-
+                      set -e && env &&
+                      export PULSAR_EXTRA_OPTS="-Xmx1G" &&
+                      /pulsar/bin/apply-config-from-env.py /pulsar/conf/client.conf &&
+                      bin/pulsar-perf produce
+                      --message-key-generation-mode random
+                      -z NONE
+                      -time 0
+                      --exit-on-failure
+                      -i 20
+                      -r 200
+                      -np 4
+                      -u pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650/
+                      persistent://public/default/test
+                  env:
+                    - name: webServiceUrl
+                      value: http://pulsar-proxy.pulsar.svc.cluster.local:8080/
+                    - name: brokerServiceUrl
+                      value: pulsar://pulsar-proxy.pulsar.svc.cluster.local:6650/
+                restartPolicy: Always
+      - path: keda-scaler.yaml
+        yaml:
+          apiVersion: keda.sh/v1alpha1
+          kind: ScaledObject
+          metadata:
+            name: pulsar-scaledobject
+            namespace: keda
+          spec:
+            scaleTargetRef:
+              apiVersion:    apps/v1  # Optional. Default: apps/v1
+              kind:          Deployment         # Optional. Default: Deployment
+              name:          consumer        # Mandatory. Must be in the same namespace as the ScaledObject
+            pollingInterval: 30                                # Optional. Default: 30 seconds
+            cooldownPeriod:  30                               # Optional. Default: 300 seconds
+            minReplicaCount: 0                                 # Optional. Default: 0
+            maxReplicaCount: 8                               # Optional. Default: 100
+            triggers:
+            - type: pulsar
+              metadata:
+                adminURL: http://pulsar-proxy.pulsar.svc.cluster.local:8080
+                topic: persistent://public/default/test-partition-0
+                subscription: subcrname
+                msgBacklogThreshold: '100'
+      - path: pulsar-values.yaml
+        data: |
+              enableAntiAffinity: no
+              restartOnConfigMapChange:
+                enabled: yes
+              image:
+                zookeeper:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                bookie:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                bastion:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                bookkeeper:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                autorecovery:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                broker:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                proxy:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+                function:
+                  repository: us-central1-docker.pkg.dev/datastax-gcp-pulsar/pulsar/lunastreaming-all
+                  tag: latest-210
+              extra:
+                function: no
+                broker: true
+                brokerSts: false
+                burnell: no
+                burnellLogCollector: no
+                pulsarHeartbeat: no
+                pulsarAdminConsole: no
+                autoRecovery: no
+              default_storage:
+                reclaimPolicy: Delete
+                existingStorageClassName: null
+                provisioner: kubernetes.io/gce-pd
+                type: pd-ssd
+                fsType: ext4
+                extraParams:
+                  replication-type: none
+              zookeeper:
+                replicaCount: 1
+              bookkeeper:
+                replicaCount: 3
+              broker:
+                component: broker
+                replicaCount: 3
+                ledger:
+                  defaultEnsembleSize: 2
+                  defaultAckQuorum:  2
+                  defaultWriteQuorum: 2
+                service:
+                  annotations: {}
+                  type: ClusterIP
+                  headless: false
+                configData:
+                  # after commit#f3ad09e2582 PR#14648
+                  loadBalancerOverrideBrokerNicSpeedGbps: '1'
+              function:
+                replicaCount: 0
+                functionReplicaCount: 0
+              proxy:
+                replicaCount: 1
+                autoPortAssign:
+                  enablePlainTextWithTLS: yes
+                service:
+                  type: LoadBalancer
+                  autoPortAssign:
+                    enabled: yes
+              grafanaDashboards:
+                enabled: true
+              pulsarAdminConsole:
+                replicaCount: 0
+                service:
+                  type: LoadBalancer
+              kube-prometheus-stack: # Luna Streaming Helm Chart
+                enabled: yes
+                prometheusOperator:
+                  enabled: yes
+                grafana:
+                  enabled: yes
+                  adminPassword: e9JYtk83*4#PM8
+                  service:
+                    type: LoadBalancer
+              pulsarSQL:
+                service:
+                  type: ClusterIP
+              enableTls: no
+              enableTokenAuth: no
+  client: server
+workload:
+  phases:
+    - create-topic:
+        module: kubectl
+        properties:
+          command: apply -f <<file:create-topic.yaml>> -n keda
+    - create-consumer:
+        module: kubectl
+        properties:
+          command: apply -f <<file:consumer.yaml>> -n keda
+    - 1m_no_load:
+        module: sleep
+        properties:
+          duration: 1m
+    - create-scaled-object:
+        module: kubectl
+        properties:
+          command: apply -f <<file:keda-scaler.yaml>> -n keda
+    - 1m_scaled_no_load:
+        module: sleep
+        properties:
+          duration: 1m
+    - create-producer:
+        module: kubectl
+        properties:
+          command: apply -f <<file:producer.yaml>> -n keda
+    - 10m_load:
+        module: sleep
+        properties:
+          duration: 10m
+  checkers:
+    nofail:
+      checker: nofail
